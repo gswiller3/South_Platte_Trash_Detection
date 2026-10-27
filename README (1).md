@@ -13,7 +13,7 @@ Two trained weight files. Both are too big to commit to the repo, so they are at
 | File | What it is | Validation numbers | Use it for |
 |---|---|---|---|
 | `best.pt` | Single class YOLOv8m, 155 MB. Trained on about 43,500 images: TACO, TrashNet, Kaggle waste sets and UAVVaste aerial litter, all collapsed to one class called `trash`. 40 epochs. | mAP50 97.4, precision 98.4, recall 93.4 | Starting point for any new fine tune. Do not run it on river frames by itself. |
-| `best_river.pt` | The river model. `best.pt` fine tuned for 15 epochs on 1,000 empty South Platte frames plus 2,900 trash images, backbone frozen, learning rate 0.001. 52 MB. | mAP50 97.5, precision 97.9, recall 91.4 | **This is the model to run on camera cards.** |
+| `best_river.pt` | The river model. `best.pt` fine tuned for 15 epochs on 1,000 empty South Platte frames plus 2,900 trash images, backbone frozen, learning rate 0.001. 52 MB. | mAP50 97.5, precision 97.9, recall 91.4 | **This is the model to run on camera cards.** It is the default in `process_camera.py`. |
 
 ### Why single class
 
@@ -29,9 +29,11 @@ The earlier 20 class model topped out at 71.8 percent mAP50 because it spent its
 - **Fine tune on new river frames.** Fully. The fine tune set used for `best_river.pt` is on the release as `river_finetune_v6.zip`, and `build_river_finetune.py` can grow it from any new card.
 - **Rebuild `best.pt` from scratch.** Not from this repo alone. That took about 43,500 images pulled from public datasets and a 42 hour training run. The sources and scripts are listed at the bottom under Rebuilding the base model, but nobody needs to do that to use or improve the system.
 
-### What is still open
+### Scale, and why detection runs at 640
 
-Field frames are noisier than the validation set. The likely cause is scale: training ran at 640 pixels on frames shrunk to 1280 wide, and `process_camera.py` defaults to inference at 1280 on the full resolution frame, so ripples show up at twice the size the model saw in training. Until that is settled, run with `--imgsz 640`. Night frames are excluded entirely with `--daylight-only` because the model has no IR training data. Every count still goes through the manual review in `score_review.py` before it is reported.
+The model was trained on whole frames shrunk to 640 pixels on the long side, so `process_camera.py` runs detection at 640 on the whole frame. The two have to match. An earlier version ran detection at 1280, and on the first card the river model boxed ripples in 99 of 200 daylight frames, worse than the base model, because the ripples showed up at twice the size it had learned to ignore. Leave `--imgsz` at 640 unless the model is retrained at a different size.
+
+The cost of 640 on a 4608 pixel wide frame is that a 10 cm item seen from a typical bridge height is roughly 10 pixels across, which is near the limit of what the model can pick up. If the manual review shows small items being missed, use tiles. `--tiles 2` cuts each frame into a 2 by 2 grid of overlapping tiles, runs each tile at 640 and merges the boxes back into frame coordinates, so everything is about twice as big to the model. It is four model passes per frame, so about four times slower. A tiled run needs a model trained on tiles, which is one extra flag in the retraining steps below. Never run a tiled model on whole frames or a whole frame model on tiles, the ripples would be at the wrong size again.
 
 ---
 
@@ -80,9 +82,9 @@ Open `test_out` and you should see your images with boxes drawn. If that works, 
 
 **6. Hardware notes.**
 
-- Apple silicon Mac: the scripts use the GPU automatically through MPS. `train_river.py` has `device="mps"` set. About 1 second per frame for detection at 1280.
-- Windows or Linux with an NVIDIA card: install the CUDA build of PyTorch first, `pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121`, then change `device="mps"` to `device=0` in `train_river.py`. Detection runs on the GPU without changes.
-- No GPU: everything still runs, detection is 5 to 10 seconds per frame, so a full 9,000 frame card is an overnight job. Change `device="mps"` to `device="cpu"` in `train_river.py` if you train, and expect training to take a day instead of an hour.
+- Apple silicon Mac: the scripts use the GPU automatically through MPS, and `train_river.py` defaults to `--device mps`. A 200 frame test took about 3 minutes at 1280 including the copy off the card, and 640 is lighter than that.
+- Windows or Linux with an NVIDIA card: install the CUDA build of PyTorch first, `pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121`, then pass `--device 0` to `train_river.py`. Detection runs on the GPU without changes.
+- No GPU: everything still runs, detection is a few seconds per frame, so a full 9,000 frame card is an overnight job. Pass `--device cpu` to `train_river.py` if you train, and expect training to take a day instead of an hour.
 - The SD card path is `/Volumes/CARDNAME` on a Mac, `E:\` or similar on Windows, `/media/username/CARDNAME` on Linux. The scripts take any folder path, so you can also copy the DCIM folder to your hard drive first and point at that.
 - `caffeinate -i` in the commands below is Mac only. Leave it off on Windows and Linux and just stop the machine from sleeping in settings.
 
@@ -95,11 +97,14 @@ South_Platte_Trash_Detection/
     river_finetune_v6/          from the release zip, only if retraining
     process_camera.py
     score_review.py
+    build_field_workbook.py
     trash_detector.py
     build_river_finetune.py
     train_river.py
     requirements.txt
+    South_Platte_Predicted_Trash_Dataset.xlsx   optional, gives the results workbook its predicted columns
     field_data/                 created by process_camera.py
+    South_Platte_Field_Results.xlsx             created by build_field_workbook.py
     runs/                       created by training
 ```
 
@@ -110,17 +115,17 @@ South_Platte_Trash_Detection/
 Plug in the card, find its name with `ls /Volumes`, then:
 
 ```
-python3 process_camera.py /Volumes/SD_10 10 --limit 200 --daylight-only --model best_river.pt --imgsz 640
+python3 process_camera.py /Volumes/SD_10 10 --limit 200 --daylight-only
 ```
 
 That is a 200 frame test. Look at `field_data/camera_10/showcase` and make sure the boxes are on trash. Then the full card:
 
 ```
 rm -rf field_data/camera_10
-caffeinate -i python3 process_camera.py /Volumes/SD_10 10 --daylight-only --skip-first 60 --model best_river.pt --imgsz 640
+caffeinate -i python3 process_camera.py /Volumes/SD_10 10 --daylight-only --skip-first 60
 ```
 
-The camera number is the second argument. It goes into the folder name and every row of the detections file, so double check it against the label on the card. `--skip-first` drops the frames of you installing the camera. `caffeinate -i` keeps a Mac awake.
+The camera number is the second argument. It goes into the folder name and every row of the detections file, so double check it against the label on the card. `--skip-first` drops the frames of you installing the camera. `--daylight-only` skips the grayscale night frames. `caffeinate -i` keeps a Mac awake. The defaults are `best_river.pt` at 640 on the whole frame; `--model`, `--imgsz`, `--conf` and `--tiles` override them, and the settings used are written into `summary.txt`.
 
 Output lands in `field_data/camera_XX/`:
 
@@ -152,7 +157,29 @@ Open `review/review_sheet.csv` and the two review folders. For each positive, ma
 python3 score_review.py 10
 ```
 
-Prints precision, miss rate and estimated recall with 95 percent confidence intervals using the Wilson method. Fifty per stratum gives about plus or minus 14 points. `--review-n 200` on the processing run tightens it to about 7. Do the full review on three or four cameras and apply those rates to the rest with a note.
+Prints precision, miss rate and estimated recall with 95 percent confidence intervals using the Wilson method. Fifty per stratum gives about plus or minus 14 points. `--review-n 200` on the processing run tightens it to about 7. Do the full review on three or four cameras and apply those rates to the rest with a note. No count goes to the client without this step; the workbook below carries the precision next to the count so the two travel together.
+
+### Building the results workbook
+
+Once a card or two has been through the steps above:
+
+```
+python3 build_field_workbook.py
+```
+
+It walks `field_data/`, reads every `camera_XX` folder, and writes `South_Platte_Field_Results.xlsx`. Nothing is typed in by hand, so run it again after every card and the workbook is rebuilt from scratch. Sheets:
+
+| Sheet | What it holds |
+|---|---|
+| `Cameras` | One row per camera: frames, night and setup frames skipped, hours of daylight covered, images with trash, total boxes, stationary and drift repeats, new items, items per daylight hour, precision and recall if the review has been scored, and the model and settings used |
+| `By_Period` | Camera by 14 day period, P1 Sep 28 to Oct 11, P2 Oct 12 to Oct 25, P3 Oct 26 to Nov 8. New items, frames, hours, rate per hour, raw boxes, days with frames |
+| `Comparison` | Same layout as the Comparison sheet in `South_Platte_Predicted_Trash_Dataset.xlsx`: predicted low, mid and high next to the observed count and rate for every camera and period, with the actual cells filled by the script. The predicted columns are read from that workbook if it is in the same folder, otherwise from `heatmap_periods_long.csv`, otherwise left blank |
+| `Heatmap_Long` | One row per camera per period with lat, lon, observed items, rate and a 0 to 1 weight. Also written as `heatmap_observed_long.csv` for kepler.gl or QGIS |
+| `Daily` | One row per camera per day with frames, hours, new items, the predicted number and the Denver gauge flow for that day. Also written as `daily_observed_long.csv` |
+| `Validation` | Precision, miss rate and recall with intervals for every camera that has a scored review sheet |
+| `Detections` | Every box from every camera with timestamp, period, coordinates, confidence and repeat type, with a filter on the header row |
+
+The camera clocks were set a year behind, so the timestamps on the cards say 2025. The script rewrites the year to 2026 before sorting frames into periods and the `Cameras` sheet says how many timestamps it fixed. Hours covered are frames times the 10 second interval, so compare cameras on items per daylight hour rather than raw counts; no two cards cover the same hours. Report new items, not total boxes.
 
 ---
 
@@ -186,7 +213,16 @@ cp runs/detect/runs/detect/river_v7/weights/best.pt best_river.pt
 
 Then rerun a 200 frame test on a card and look at the showcase folder. If the ripple boxes are down and real trash still gets boxed, keep it. If not, go back to the old one and change something.
 
-To fix the scale problem for good, the next training run should use `--imgsz 1280` or tile the full frame. That is the next thing to try.
+**4. Tiles, only if small items are being missed.** Build the set with `--tile 2`, which cuts every river frame into the same 2 by 2 overlapping grid that `process_camera.py --tiles 2` uses, so the model trains on river texture at the size it will see it. Fewer frames are pulled off the card so the background count stays near 1,000 against 2,900 trash images.
+
+```
+python3 build_river_finetune.py /Volumes/SD_07 --camera 7 --trash-dir river_finetune_v6 --out river_tiles2 --tile 2
+caffeinate -i python3 train_river.py --data river_tiles2/river_finetune.yaml --name river_tiles2
+cp runs/detect/runs/detect/river_tiles2/weights/best.pt best_river_tiles2.pt
+python3 process_camera.py /Volumes/SD_10 10 --limit 200 --daylight-only --tiles 2 --model best_river_tiles2.pt
+```
+
+Keep the tiled model and the whole frame model as separate files and always pair `--tiles 2` with the tiled one. The `Tiles` line in `summary.txt` records which was used.
 
 ---
 
@@ -196,7 +232,8 @@ To fix the scale problem for good, the next training run should use `--imgsz 128
 |---|---|
 | `process_camera.py` | Runs a card through the model, writes everything above |
 | `score_review.py` | Scores the manual review sheet |
-| `build_river_finetune.py` | Builds the river background training set from a card |
+| `build_field_workbook.py` | Builds `South_Platte_Field_Results.xlsx` from every camera folder in `field_data/` |
+| `build_river_finetune.py` | Builds the river background training set from a card, whole frames or tiles |
 | `train_river.py` | Fine tunes `best.pt` on that set |
 | `trash_detector.py` | Simple detector, one folder in, annotated folder out, no repeat logic. Fine for a quick look. |
 | `train_mega.py` | Original training script for `best.pt`, see Rebuilding the base model |
@@ -218,7 +255,8 @@ Not in the repo: `best.pt`, `best_river.pt` and `river_finetune_v6.zip` are on t
 - HEIC cannot be read by OpenCV. The GardePro cards are JPG so this only matters for phone photos.
 - Keep the scripts, the model and the yaml in the same folder, or use full paths.
 - Do not run `trash_detector_v3.py` or `quickstart.py` from the old repo. They use the 20 class model and label everything as plastic_bag.
-- If the Mac fans go full speed and progress stops, the image size is too big for the GPU. Add `--imgsz 640`.
+- If the Mac fans go full speed and progress stops, the GPU is choking on the image size. The default 640 whole frame is light, so check whether a bigger `--imgsz` or `--tiles` got passed.
+- `build_field_workbook.py` needs `openpyxl`, which is in `requirements.txt`. If the Comparison sheet has blank predicted columns, put `South_Platte_Predicted_Trash_Dataset.xlsx` in the same folder and rerun.
 
 ---
 
