@@ -1,0 +1,9 @@
+# Single-class trash detection dataset
+# Every box is class 0 = "trash" (no sub-types).
+path: /Users/gswiller333gmail.com/Desktop/Trash_Gang/mega_training/combined_dataset
+train: train/images
+val: val/images
+
+nc: 1
+names:
+  0: trash
